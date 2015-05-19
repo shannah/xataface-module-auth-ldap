@@ -39,6 +39,11 @@ class dataface_modules_ldap {
 		$app =& Dataface_Application::getInstance();
 		
 		$creds = $auth->getCredentials();
+		$creds['UserName'] = trim($creds['UserName']);
+		$creds['Password'] = trim($creds['Password']);
+		if (empty($creds['UserName']) or empty($creds['Password'])) {
+		    return false;
+		}
 		
 		if ( !isset($auth->conf['ldap_host']) ) $auth->conf['ldap_host'] = 'localhost';
 		if ( !isset($auth->conf['ldap_port']) ) $auth->conf['ldap_port'] = null;
