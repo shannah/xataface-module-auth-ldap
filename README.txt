@@ -46,3 +46,7 @@ Installation
   Please see the Getting Started with Dataface tutorial's section on permissions
      for more information about the '_auth' section of the conf.ini  file. 
      (http://xataface.com/documentation/tutorial/getting_started/permissions)
+     
+Optional properties:
+
+ldap_version : The version number of the LDAP protocol to use (e.g. 3)

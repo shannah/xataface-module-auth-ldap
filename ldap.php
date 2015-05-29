@@ -57,6 +57,10 @@ class dataface_modules_ldap {
 		$ds = ldap_connect($auth->conf['ldap_host'], $auth->conf['ldap_port']);
 		if ( !$ds ) trigger_error("Failed to connect to LDAP server", E_USER_ERROR);
 		
+		if (isset($auth->conf['ldap_version'])) {
+		    ldap_set_option($ds, LDAP_OPT_PROTOCOL_VERSION, intval($auth->conf['ldap_version']));
+		}
+		
 		$r = @ldap_search($ds, 'uid='.$creds['UserName'].', '.$auth->conf['ldap_base'],'objectclass=*' );
 		if ( $r ){
 
