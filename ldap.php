@@ -50,18 +50,26 @@ class dataface_modules_ldap {
 		if ( !isset($auth->conf['ldap_base']) ){
 			trigger_error("Please specify the LDAP basedn in the [_auth] section of the conf.ini file.", E_USER_ERROR);
 		}
-		
+
 		if ( !function_exists('ldap_connect') ){
-			trigger_error("Please install the PHP LDAP module in order to user LDAP authentication.", E_USER_ERROR);
+			trigger_error("Please install the PHP LDAP module in order to use LDAP authentication.", E_USER_ERROR);
 		}
-		$ds = ldap_connect($auth->conf['ldap_host'], $auth->conf['ldap_port']);
+		// Build URI to avoid deprecated $port parameter in PHP 8.3+
+		$ldap_uri = $auth->conf['ldap_host'];
+		if (!preg_match('#^ldaps?://#', $ldap_uri)) {
+			$ldap_uri = 'ldap://' . $ldap_uri;
+		}
+		if (!empty($auth->conf['ldap_port'])) {
+			$ldap_uri = rtrim($ldap_uri, '/') . ':' . intval($auth->conf['ldap_port']);
+		}
+		$ds = @ldap_connect($ldap_uri);
 		if ( !$ds ) trigger_error("Failed to connect to LDAP server", E_USER_ERROR);
 		
 		if (isset($auth->conf['ldap_version'])) {
 		    ldap_set_option($ds, LDAP_OPT_PROTOCOL_VERSION, intval($auth->conf['ldap_version']));
 		}
 		
-		$r = @ldap_search($ds, 'uid='.$creds['UserName'].', '.$auth->conf['ldap_base'],'objectclass=*' );
+		$r = @ldap_search($ds, 'uid='.ldap_escape($creds['UserName'], '', LDAP_ESCAPE_DN).', '.$auth->conf['ldap_base'],'objectclass=*' );
 		if ( $r ){
 
 			$result = @ldap_get_entries($ds, $r);
