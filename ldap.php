@@ -97,8 +97,11 @@ class dataface_modules_ldap {
 		// Allow the application delegate to veto or prepare for authentication
 		// before we attempt to locate and bind the user. Returning boolean
 		// false from beforeLdapAuthenticate() denies the login.
-		if ( $this->fireDelegateHook('beforeLdapAuthenticate', array($creds['UserName'], $ds)) === false ){
-			return false;
+		$delegate =& $app->getDelegate();
+		if ( $delegate !== null && method_exists($delegate, 'beforeLdapAuthenticate') ){
+			if ( $delegate->beforeLdapAuthenticate($creds['UserName'], $ds) === false ){
+				return false;
+			}
 		}
 
 		$useSearchMode = isset($conf['ldap_filter'])
@@ -116,23 +119,11 @@ class dataface_modules_ldap {
 		// Authentication succeeded. Let the application delegate run any
 		// post-authentication logic - e.g. provisioning a local user record,
 		// syncing profile fields, or audit logging. The return value is ignored.
-		$this->fireDelegateHook('afterLdapAuthenticate', array($creds['UserName'], $entry, $ds));
+		if ( $delegate !== null && method_exists($delegate, 'afterLdapAuthenticate') ){
+			$delegate->afterLdapAuthenticate($creds['UserName'], $entry, $ds);
+		}
 
 		return true;
-	}
-
-	/**
-	 * Calls a hook method on the application delegate class, if defined,
-	 * passing $args. Returns the delegate method's return value, or null when
-	 * there is no delegate or it does not implement the method.
-	 */
-	private function fireDelegateHook($method, $args){
-		$app =& Dataface_Application::getInstance();
-		$delegate =& $app->getDelegate();
-		if ( $delegate !== null && method_exists($delegate, $method) ){
-			return call_user_func_array(array($delegate, $method), $args);
-		}
-		return null;
 	}
 
 	/**
