@@ -75,3 +75,31 @@ Example (Active Directory):
 	ldap_username_attribute = "sAMAccountName"
 	ldap_bind_dn = "cn=svc-xataface,ou=Service Accounts,dc=example,dc=com"
 	ldap_bind_password = "<service account password>"
+
+
+Delegate hooks
+--------------
+
+The module calls two optional hooks on your application's delegate class, if
+they are implemented. They let your application run custom logic around LDAP
+authentication - e.g. provisioning a local user record on first login, syncing
+profile fields, or audit logging - without modifying the module itself.
+
+beforeLdapAuthenticate($username, $ds)
+    Called after connecting to the LDAP server but before the user is located
+    and bound. Return boolean false to deny the login; any other return value
+    (including none) allows it to proceed. $ds is the LDAP connection.
+
+afterLdapAuthenticate($username, $entry, $ds)
+    Called only after the user has been successfully authenticated. $entry is
+    the matched LDAP entry (as returned by ldap_get_entries()), so you can read
+    attributes such as $entry['displayname'][0] or $entry['mail'][0]. The
+    return value is ignored.
+
+Example (in your application's delegate class):
+
+	function afterLdapAuthenticate($username, $entry, $ds){
+		// Auto-create a local user record on first login.
+		$email = isset($entry['mail'][0]) ? $entry['mail'][0] : '';
+		// ... INSERT/UPDATE your users table here ...
+	}

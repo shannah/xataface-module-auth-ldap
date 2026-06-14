@@ -94,20 +94,51 @@ class dataface_modules_ldap {
 		//      the password. Required for Active Directory and any directory
 		//      that doesn't expose the username in the RDN or disallows
 		//      anonymous search.
+		// Allow the application delegate to veto or prepare for authentication
+		// before we attempt to locate and bind the user. Returning boolean
+		// false from beforeLdapAuthenticate() denies the login.
+		if ( $this->fireDelegateHook('beforeLdapAuthenticate', array($creds['UserName'], $ds)) === false ){
+			return false;
+		}
+
 		$useSearchMode = isset($conf['ldap_filter'])
 			|| isset($conf['ldap_bind_dn'])
 			|| isset($conf['ldap_username_attribute']);
 
-		if (!$useSearchMode) {
-			return $this->bindDirect($ds, $creds, $conf);
+		$entry = $useSearchMode
+			? $this->bindViaSearch($ds, $creds, $conf)
+			: $this->bindDirect($ds, $creds, $conf);
+
+		if ( $entry === false ){
+			return false;
 		}
 
-		return $this->bindViaSearch($ds, $creds, $conf);
+		// Authentication succeeded. Let the application delegate run any
+		// post-authentication logic - e.g. provisioning a local user record,
+		// syncing profile fields, or audit logging. The return value is ignored.
+		$this->fireDelegateHook('afterLdapAuthenticate', array($creds['UserName'], $entry, $ds));
+
+		return true;
+	}
+
+	/**
+	 * Calls a hook method on the application delegate class, if defined,
+	 * passing $args. Returns the delegate method's return value, or null when
+	 * there is no delegate or it does not implement the method.
+	 */
+	private function fireDelegateHook($method, $args){
+		$app =& Dataface_Application::getInstance();
+		$delegate =& $app->getDelegate();
+		if ( $delegate !== null && method_exists($delegate, $method) ){
+			return call_user_func_array(array($delegate, $method), $args);
+		}
+		return null;
 	}
 
 	/**
 	 * Direct-DN bind (legacy behaviour). Assumes the user DN is
-	 * "uid=<username>,<base>" and binds to it directly.
+	 * "uid=<username>,<base>" and binds to it directly. Returns the matched
+	 * LDAP entry on success, or false on failure.
 	 */
 	private function bindDirect($ds, $creds, $conf){
 		$dn = 'uid='.ldap_escape($creds['UserName'], '', LDAP_ESCAPE_DN).', '.$conf['ldap_base'];
@@ -116,7 +147,7 @@ class dataface_modules_ldap {
 			$result = @ldap_get_entries($ds, $r);
 			if ( !empty($result[0]['dn']) ){
 				if ( @ldap_bind($ds, $result[0]['dn'], $creds['Password']) ){
-					return true;
+					return $result[0];
 				}
 			}
 		}
@@ -127,7 +158,8 @@ class dataface_modules_ldap {
 	 * Search-then-bind. Optionally binds with a service account
 	 * (ldap_bind_dn / ldap_bind_password), searches the directory for the
 	 * user using a configurable filter, then re-binds as the located DN with
-	 * the supplied password.
+	 * the supplied password. Returns the matched LDAP entry on success, or
+	 * false on failure.
 	 */
 	private function bindViaSearch($ds, $creds, $conf){
 		// Optional service/search account. Without it the search is anonymous.
@@ -160,7 +192,7 @@ class dataface_modules_ldap {
 
 		// Re-bind as the located user to verify the password.
 		if ( @ldap_bind($ds, $result[0]['dn'], $creds['Password']) ){
-			return true;
+			return $result[0];
 		}
 
 		return false;
