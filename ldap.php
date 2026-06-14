@@ -81,19 +81,6 @@ class dataface_modules_ldap {
 			ldap_set_option($ds, LDAP_OPT_REFERRALS, intval($conf['ldap_referrals']));
 		}
 
-		// There are two ways to locate and verify the user:
-		//
-		//  (1) Direct-DN mode (default, backwards compatible): the user's DN is
-		//      assumed to be "uid=<username>,<base>" and we bind to it directly.
-		//      This is the original behaviour and is used when none of the
-		//      search-mode options (ldap_filter, ldap_bind_dn,
-		//      ldap_username_attribute) are configured.
-		//
-		//  (2) Search mode: optionally bind with a service account, search the
-		//      directory for the user, then re-bind as the located DN to verify
-		//      the password. Required for Active Directory and any directory
-		//      that doesn't expose the username in the RDN or disallows
-		//      anonymous search.
 		// Allow the application delegate to veto or prepare for authentication
 		// before we attempt to locate and bind the user. Returning boolean
 		// false from beforeLdapAuthenticate() denies the login.
@@ -104,53 +91,98 @@ class dataface_modules_ldap {
 			}
 		}
 
+		// There are two ways to locate and verify the user:
+		//
+		//  (1) Direct-DN mode (default, backwards compatible): the user's DN is
+		//      assumed to be "uid=<username>,<base>" and we bind to it directly.
+		//      Used when none of the search-mode options (ldap_filter,
+		//      ldap_bind_dn, ldap_username_attribute) are configured.
+		//
+		//  (2) Search mode: optionally bind with a service account, search the
+		//      directory for the user, then re-bind as the located user to
+		//      verify the password. Required for Active Directory and any
+		//      directory that doesn't expose the username in the RDN or
+		//      disallows anonymous search.
 		$useSearchMode = isset($conf['ldap_filter'])
 			|| isset($conf['ldap_bind_dn'])
 			|| isset($conf['ldap_username_attribute']);
 
-		$entry = $useSearchMode
+		$result = $useSearchMode
 			? $this->bindViaSearch($ds, $creds, $conf)
 			: $this->bindDirect($ds, $creds, $conf);
 
-		if ( $entry === false ){
-			return false;
+		if ( $result['status'] === 'ok' ){
+			// Authentication succeeded. Let the application delegate run any
+			// post-authentication logic - e.g. provisioning a local user
+			// record, syncing profile fields, or audit logging. The return
+			// value is ignored.
+			if ( $delegate !== null && method_exists($delegate, 'afterLdapAuthenticate') ){
+				$delegate->afterLdapAuthenticate($creds['UserName'], $result['entry'], $ds, $creds['Password']);
+			}
+			return true;
 		}
 
-		// Authentication succeeded. Let the application delegate run any
-		// post-authentication logic - e.g. provisioning a local user record,
-		// syncing profile fields, or audit logging. The return value is ignored.
-		if ( $delegate !== null && method_exists($delegate, 'afterLdapAuthenticate') ){
-			$delegate->afterLdapAuthenticate($creds['UserName'], $entry, $ds);
+		// Authentication failed. Give the delegate a chance to authenticate the
+		// user by some other means (e.g. a local password fallback), via a hook
+		// specific to the reason for failure. A hook may approve the login by
+		// returning boolean true; any other return value leaves it denied.
+		//
+		//   ldapUserNotFound()       - the user was not found in the directory.
+		//   ldapInvalidCredentials() - the user exists but the password (or
+		//                              account state) was rejected.
+		//
+		// Connection / service-account problems (status 'error') intentionally
+		// do not trigger a fallback hook.
+		if ( $result['status'] === 'not_found' ){
+			if ( $delegate !== null && method_exists($delegate, 'ldapUserNotFound')
+					&& $delegate->ldapUserNotFound($creds['UserName'], $creds['Password'], $ds) === true ){
+				return true;
+			}
+		} else if ( $result['status'] === 'invalid_credentials' ){
+			if ( $delegate !== null && method_exists($delegate, 'ldapInvalidCredentials')
+					&& $delegate->ldapInvalidCredentials($creds['UserName'], $creds['Password'], $ds) === true ){
+				return true;
+			}
 		}
 
-		return true;
+		return false;
 	}
 
 	/**
 	 * Direct-DN bind (legacy behaviour). Assumes the user DN is
-	 * "uid=<username>,<base>" and binds to it directly. Returns the matched
-	 * LDAP entry on success, or false on failure.
+	 * "uid=<username>,<base>" and binds to it directly.
+	 *
+	 * Returns an array describing the outcome:
+	 *   array('status' => 'ok', 'entry' => <ldap entry>)  on success
+	 *   array('status' => 'not_found')                    if the DN doesn't exist
+	 *   array('status' => 'invalid_credentials')          if the bind was rejected
 	 */
 	private function bindDirect($ds, $creds, $conf){
 		$dn = 'uid='.ldap_escape($creds['UserName'], '', LDAP_ESCAPE_DN).', '.$conf['ldap_base'];
 		$r = @ldap_search($ds, $dn, 'objectclass=*');
-		if ( $r ){
-			$result = @ldap_get_entries($ds, $r);
-			if ( !empty($result[0]['dn']) ){
-				if ( @ldap_bind($ds, $result[0]['dn'], $creds['Password']) ){
-					return $result[0];
-				}
-			}
+		if ( !$r ) return array('status' => 'not_found');
+
+		$result = @ldap_get_entries($ds, $r);
+		if ( empty($result[0]['dn']) ) return array('status' => 'not_found');
+
+		if ( @ldap_bind($ds, $result[0]['dn'], $creds['Password']) ){
+			return array('status' => 'ok', 'entry' => $result[0]);
 		}
-		return false;
+		return array('status' => 'invalid_credentials');
 	}
 
 	/**
 	 * Search-then-bind. Optionally binds with a service account
 	 * (ldap_bind_dn / ldap_bind_password), searches the directory for the
-	 * user using a configurable filter, then re-binds as the located DN with
-	 * the supplied password. Returns the matched LDAP entry on success, or
-	 * false on failure.
+	 * user using a configurable filter, then re-binds as the located user (by
+	 * DN, or by the ldap_userbind_attribute value) to verify the password.
+	 *
+	 * Returns an array describing the outcome:
+	 *   array('status' => 'ok', 'entry' => <ldap entry>)  on success
+	 *   array('status' => 'not_found')                    if no entry matched
+	 *   array('status' => 'invalid_credentials')          if the bind was rejected
+	 *   array('status' => 'error')                        on a service-account /
+	 *                                                      search error
 	 */
 	private function bindViaSearch($ds, $creds, $conf){
 		// Optional service/search account. Without it the search is anonymous.
@@ -161,7 +193,7 @@ class dataface_modules_ldap {
 			$bind_pw = isset($conf['ldap_bind_password']) ? $conf['ldap_bind_password'] : '';
 			if ( $bind_pw === '' || !@ldap_bind($ds, $conf['ldap_bind_dn'], $bind_pw) ){
 				trigger_error("Failed to bind to LDAP with the configured service account (ldap_bind_dn).", E_USER_ERROR);
-				return false;
+				return array('status' => 'error');
 			}
 		}
 
@@ -176,17 +208,30 @@ class dataface_modules_ldap {
 		}
 
 		$r = @ldap_search($ds, $conf['ldap_base'], $filter);
-		if ( !$r ) return false;
+		if ( !$r ) return array('status' => 'error');
 
 		$result = @ldap_get_entries($ds, $r);
-		if ( empty($result[0]['dn']) ) return false;
+		if ( empty($result[0]['dn']) ) return array('status' => 'not_found');
 
-		// Re-bind as the located user to verify the password.
-		if ( @ldap_bind($ds, $result[0]['dn'], $creds['Password']) ){
-			return $result[0];
+		// Determine the identity to bind as. By default this is the entry's DN;
+		// ldap_userbind_attribute lets you bind as another attribute's value
+		// (e.g. "userPrincipalName" or "displayName") for directories that
+		// expect that form.
+		$bind_as = $result[0]['dn'];
+		if ( isset($conf['ldap_userbind_attribute']) ){
+			$ua = strtolower($conf['ldap_userbind_attribute']);
+			if ( empty($result[0][$ua][0]) ){
+				return array('status' => 'invalid_credentials');
+			}
+			$bind_as = $result[0][$ua][0];
 		}
 
-		return false;
+		// Re-bind as the located user to verify the password.
+		if ( @ldap_bind($ds, $bind_as, $creds['Password']) ){
+			return array('status' => 'ok', 'entry' => $result[0]);
+		}
+
+		return array('status' => 'invalid_credentials');
 	}
 	
 	
