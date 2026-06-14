@@ -40,6 +40,9 @@ class dataface_modules_ldap {
 		$conf =& $auth->conf;
 
 		$creds = $auth->getCredentials();
+		if (empty($creds['UserName']) or empty($creds['Password'])) {
+		    return false;
+		}
 		$creds['UserName'] = trim($creds['UserName']);
 		$creds['Password'] = trim($creds['Password']);
 		if (empty($creds['UserName']) or empty($creds['Password'])) {
