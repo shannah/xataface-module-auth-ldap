@@ -37,50 +37,129 @@ class dataface_modules_ldap {
 	function checkCredentials(){
 		$auth =& Dataface_AuthenticationTool::getInstance();
 		$app =& Dataface_Application::getInstance();
-		
+		$conf =& $auth->conf;
+
 		$creds = $auth->getCredentials();
 		$creds['UserName'] = trim($creds['UserName']);
 		$creds['Password'] = trim($creds['Password']);
 		if (empty($creds['UserName']) or empty($creds['Password'])) {
 		    return false;
 		}
-		
-		if ( !isset($auth->conf['ldap_host']) ) $auth->conf['ldap_host'] = 'localhost';
-		if ( !isset($auth->conf['ldap_port']) ) $auth->conf['ldap_port'] = null;
-		if ( !isset($auth->conf['ldap_base']) ){
+
+		if ( !isset($conf['ldap_host']) ) $conf['ldap_host'] = 'localhost';
+		if ( !isset($conf['ldap_port']) ) $conf['ldap_port'] = null;
+		if ( !isset($conf['ldap_base']) ){
 			trigger_error("Please specify the LDAP basedn in the [_auth] section of the conf.ini file.", E_USER_ERROR);
 		}
 
 		if ( !function_exists('ldap_connect') ){
 			trigger_error("Please install the PHP LDAP module in order to use LDAP authentication.", E_USER_ERROR);
 		}
+
 		// Build URI to avoid deprecated $port parameter in PHP 8.3+
-		$ldap_uri = $auth->conf['ldap_host'];
+		$ldap_uri = $conf['ldap_host'];
 		if (!preg_match('#^ldaps?://#', $ldap_uri)) {
 			$ldap_uri = 'ldap://' . $ldap_uri;
 		}
-		if (!empty($auth->conf['ldap_port'])) {
-			$ldap_uri = rtrim($ldap_uri, '/') . ':' . intval($auth->conf['ldap_port']);
+		if (!empty($conf['ldap_port'])) {
+			$ldap_uri = rtrim($ldap_uri, '/') . ':' . intval($conf['ldap_port']);
 		}
 		$ds = @ldap_connect($ldap_uri);
 		if ( !$ds ) trigger_error("Failed to connect to LDAP server", E_USER_ERROR);
-		
-		if (isset($auth->conf['ldap_version'])) {
-		    ldap_set_option($ds, LDAP_OPT_PROTOCOL_VERSION, intval($auth->conf['ldap_version']));
-		}
-		
-		$r = @ldap_search($ds, 'uid='.ldap_escape($creds['UserName'], '', LDAP_ESCAPE_DN).', '.$auth->conf['ldap_base'],'objectclass=*' );
-		if ( $r ){
 
+		// Protocol v3 is required by most modern directories (incl. Active
+		// Directory). Default to 3 but allow override via conf.
+		$ldap_version = isset($conf['ldap_version']) ? intval($conf['ldap_version']) : 3;
+		ldap_set_option($ds, LDAP_OPT_PROTOCOL_VERSION, $ldap_version);
+
+		// Active Directory typically needs referral chasing disabled
+		// (ldap_referrals = 0) for searches to behave.
+		if (isset($conf['ldap_referrals'])) {
+			ldap_set_option($ds, LDAP_OPT_REFERRALS, intval($conf['ldap_referrals']));
+		}
+
+		// There are two ways to locate and verify the user:
+		//
+		//  (1) Direct-DN mode (default, backwards compatible): the user's DN is
+		//      assumed to be "uid=<username>,<base>" and we bind to it directly.
+		//      This is the original behaviour and is used when none of the
+		//      search-mode options (ldap_filter, ldap_bind_dn,
+		//      ldap_username_attribute) are configured.
+		//
+		//  (2) Search mode: optionally bind with a service account, search the
+		//      directory for the user, then re-bind as the located DN to verify
+		//      the password. Required for Active Directory and any directory
+		//      that doesn't expose the username in the RDN or disallows
+		//      anonymous search.
+		$useSearchMode = isset($conf['ldap_filter'])
+			|| isset($conf['ldap_bind_dn'])
+			|| isset($conf['ldap_username_attribute']);
+
+		if (!$useSearchMode) {
+			return $this->bindDirect($ds, $creds, $conf);
+		}
+
+		return $this->bindViaSearch($ds, $creds, $conf);
+	}
+
+	/**
+	 * Direct-DN bind (legacy behaviour). Assumes the user DN is
+	 * "uid=<username>,<base>" and binds to it directly.
+	 */
+	private function bindDirect($ds, $creds, $conf){
+		$dn = 'uid='.ldap_escape($creds['UserName'], '', LDAP_ESCAPE_DN).', '.$conf['ldap_base'];
+		$r = @ldap_search($ds, $dn, 'objectclass=*');
+		if ( $r ){
 			$result = @ldap_get_entries($ds, $r);
-			//print_r($result);exit;
-			if ( $result[0] ){
-				if ( @ldap_bind( $ds, $result[0]['dn'], $creds['Password']) ){
+			if ( !empty($result[0]['dn']) ){
+				if ( @ldap_bind($ds, $result[0]['dn'], $creds['Password']) ){
 					return true;
 				}
 			}
 		}
-		
+		return false;
+	}
+
+	/**
+	 * Search-then-bind. Optionally binds with a service account
+	 * (ldap_bind_dn / ldap_bind_password), searches the directory for the
+	 * user using a configurable filter, then re-binds as the located DN with
+	 * the supplied password.
+	 */
+	private function bindViaSearch($ds, $creds, $conf){
+		// Optional service/search account. Without it the search is anonymous.
+		// Note: binding with a DN but an empty password is an "unauthenticated
+		// bind" that many servers accept as anonymous - so require a password
+		// whenever a bind DN is configured.
+		if ( isset($conf['ldap_bind_dn']) ){
+			$bind_pw = isset($conf['ldap_bind_password']) ? $conf['ldap_bind_password'] : '';
+			if ( $bind_pw === '' || !@ldap_bind($ds, $conf['ldap_bind_dn'], $bind_pw) ){
+				trigger_error("Failed to bind to LDAP with the configured service account (ldap_bind_dn).", E_USER_ERROR);
+				return false;
+			}
+		}
+
+		// Build the search filter. ldap_filter may contain a {username}
+		// placeholder; otherwise default to "(<attr>=<username>)".
+		$attr = isset($conf['ldap_username_attribute']) ? $conf['ldap_username_attribute'] : 'uid';
+		$escaped_user = ldap_escape($creds['UserName'], '', LDAP_ESCAPE_FILTER);
+		if ( isset($conf['ldap_filter']) ){
+			$filter = str_replace('{username}', $escaped_user, $conf['ldap_filter']);
+		} else {
+			$filter = '('.$attr.'='.$escaped_user.')';
+		}
+
+		$r = @ldap_search($ds, $conf['ldap_base'], $filter);
+		if ( !$r ) return false;
+
+		$result = @ldap_get_entries($ds, $r);
+		if ( empty($result[0]['dn']) ) return false;
+
+		// Re-bind as the located user to verify the password.
+		if ( @ldap_bind($ds, $result[0]['dn'], $creds['Password']) ){
+			return true;
+		}
+
 		return false;
 	}
 	
